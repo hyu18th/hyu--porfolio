@@ -3,228 +3,116 @@ $ErrorActionPreference = "Stop"
 # ============================================================
 # 1. CẤU HÌNH THƯ MỤC
 # ============================================================
-
-# Thư mục chứa CSV được hệ thống xuất ra
-$dataDir = "C:\data"
-
-# Thư mục làm việc của chương trình
-$workDir = "C:\SnowflakeAuto"
-
-# Lưu file sau khi nạp thành công
+$dataDir    = "C:\data"
+$workDir    = "C:\SnowflakeAuto"
 $archiveDir = Join-Path $workDir "archive"
-
-# File SQL được tạo tự động
-$sqlPath = Join-Path $workDir "copy_into_latest.sql"
-
-# File log
-$logPath = Join-Path $workDir "process_log.txt"
-
-# Lock file, tránh chạy hai tiến trình cùng lúc
-$lockPath = Join-Path $workDir "process.lock"
+$sqlPath    = Join-Path $workDir "copy_into_latest.sql"
+$logPath    = Join-Path $workDir "process_log.txt"
+$lockPath   = Join-Path $workDir "process.lock"
 
 # ============================================================
 # 2. CẤU HÌNH SNOWFLAKE
 # ============================================================
-
-# Connection trong:
-# C:\Users\<User>\.snowflake\config.toml
 $snowConnection = "my_conn"
-
-$snowRole      = "CSV_LOADER_ROLE"
-$snowWarehouse = "LOAD_WH"
-$snowDatabase  = "MY_DB"
-$snowSchema    = "IMPORT"
+$snowRole       = "CSV_LOADER_ROLE"
+$snowWarehouse  = "LOAD_WH"
+$snowDatabase   = "MY_DB"
+$snowSchema     = "IMPORT"
 
 # ============================================================
 # 3. MAPPING TÊN FILE VỚI BẢNG SNOWFLAKE
 # ============================================================
-#
-# DatasetName phải khớp với phần tên file nằm trước timestamp.
-#
-# Ví dụ:
-# DR_M_CUST_20260812_110015.csv
-# DatasetName = DR_M_CUST
-#
-# Thay TableName bằng tên bảng thực tế trong Snowflake.
-# ============================================================
-
 $tableMapping = @(
-    [pscustomobject]@{
-        DatasetName = "DR_M_CUST"
-        TableName   = "M_CUST"
-    },
-    [pscustomobject]@{
-        DatasetName = "DR_M_ENTITY"
-        TableName   = "M_ENTITY"
-    },
-    [pscustomobject]@{
-        DatasetName = "DR_M_PRODUCT"
-        TableName   = "M_PRODUCT"
-    },
-    [pscustomobject]@{
-        DatasetName = "DR_M_PRODUCT_CATEGORY"
-        TableName   = "M_PRODUCT_CATEGORY"
-    },
-    [pscustomobject]@{
-        DatasetName = "DR_M_STORE"
-        TableName   = "M_STORE"
-    },
-    [pscustomobject]@{
-        DatasetName = "DR_T_PRODUCT_SALES"
-        TableName   = "T_PRODUCT_SALES"
-    },
-    [pscustomobject]@{
-        DatasetName = "DR_T_PRODUCT_SALES_BUDGET"
-        TableName   = "T_PRODUCT_SALES_BUDGET"
-    }
+    [pscustomobject]@{ DatasetName = "DR_M_CUST";                 TableName = "M_CUST" },
+    [pscustomobject]@{ DatasetName = "DR_M_ENTITY";               TableName = "M_ENTITY" },
+    [pscustomobject]@{ DatasetName = "DR_M_PRODUCT";              TableName = "M_PRODUCT" },
+    [pscustomobject]@{ DatasetName = "DR_M_PRODUCT_CATEGORY";     TableName = "M_PRODUCT_CATEGORY" },
+    [pscustomobject]@{ DatasetName = "DR_M_STORE";                TableName = "M_STORE" },
+    [pscustomobject]@{ DatasetName = "DR_T_PRODUCT_SALES";        TableName = "T_PRODUCT_SALES" },
+    [pscustomobject]@{ DatasetName = "DR_T_PRODUCT_SALES_BUDGET"; TableName = "T_PRODUCT_SALES_BUDGET" }
 )
 
 # ============================================================
 # 4. TẠO THƯ MỤC
 # ============================================================
-
 foreach ($directory in @($workDir, $archiveDir)) {
     if (-not (Test-Path -LiteralPath $directory)) {
-        New-Item `
-            -Path $directory `
-            -ItemType Directory `
-            -Force |
-            Out-Null
+        New-Item -Path $directory -ItemType Directory -Force | Out-Null
     }
 }
 
 # ============================================================
 # 5. HÀM GHI LOG
 # ============================================================
-
 function Write-Log {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Message
     )
-
     $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-
     $logMessage = "$time - $Message"
-
     Write-Host $logMessage
-
-    $logMessage |
-        Out-File `
-            -FilePath $logPath `
-            -Append `
-            -Encoding UTF8
+    $logMessage | Out-File -FilePath $logPath -Append -Encoding UTF8
 }
 
 # ============================================================
 # 6. KIỂM TRA KHÔNG CHẠY TRÙNG JOB
 # ============================================================
-
 if (Test-Path -LiteralPath $lockPath) {
     Write-Log "BỎ QUA: Phát hiện một quy trình khác đang chạy."
     exit 2
 }
 
-New-Item `
-    -Path $lockPath `
-    -ItemType File `
-    -Force |
-    Out-Null
+New-Item -Path $lockPath -ItemType File -Force | Out-Null
 
 Write-Log "===================================================="
 Write-Log "BẮT ĐẦU QUÁ TRÌNH NẠP FILE CSV VÀO SNOWFLAKE"
 Write-Log "===================================================="
 
 try {
-    # ========================================================
     # 7. KIỂM TRA THƯ MỤC CSV
-    # ========================================================
-
     if (-not (Test-Path -LiteralPath $dataDir -PathType Container)) {
         throw "Không tìm thấy thư mục CSV: $dataDir"
     }
 
-    # ========================================================
     # 8. KIỂM TRA SNOWFLAKE CLI
-    # ========================================================
-
     $snowCommand = Get-Command "snow.exe" -ErrorAction SilentlyContinue
-
     if (-not $snowCommand) {
         $snowCommand = Get-Command "snow" -ErrorAction SilentlyContinue
     }
-
     if (-not $snowCommand) {
         throw "Không tìm thấy Snowflake CLI trong PATH."
     }
 
     $snowExe = $snowCommand.Source
-
     Write-Log "Snowflake CLI: $snowExe"
-    Write-Log "Connection: $snowConnection"
-    Write-Log "Database: $snowDatabase"
-    Write-Log "Schema: $snowSchema"
-    Write-Log "Warehouse: $snowWarehouse"
-    Write-Log "Role: $snowRole"
 
-    # ========================================================
     # 9. KIỂM TRA CONNECTION
-    # ========================================================
-
     Write-Log "Đang kiểm tra kết nối Snowflake..."
-
-    $connectionOutput = & $snowExe connection test `
-        --connection $snowConnection 2>&1
-
-    $connectionOutput |
-        ForEach-Object {
-            Write-Log "[SNOW] $_"
-        }
+    $connectionOutput = & $snowExe connection test --connection $snowConnection 2>&1
+    $connectionOutput | ForEach-Object { Write-Log "[SNOW] $_" }
 
     if ($LASTEXITCODE -ne 0) {
         throw "Không thể kết nối Snowflake bằng connection '$snowConnection'."
     }
-
     Write-Log "Kết nối Snowflake thành công."
 
-    # ========================================================
     # 10. QUÉT TẤT CẢ FILE CSV
-    # ========================================================
-
     Write-Log "Đang quét file CSV trong: $dataDir"
-
-    $allCsvFiles = Get-ChildItem `
-        -LiteralPath $dataDir `
-        -Filter "*.csv" `
-        -File
+    $allCsvFiles = Get-ChildItem -LiteralPath $dataDir -Filter "*.csv" -File
 
     if (-not $allCsvFiles) {
         Write-Log "Không tìm thấy file CSV nào."
         exit 0
     }
 
-    Write-Log "Tổng số file CSV tìm thấy: $($allCsvFiles.Count)"
-
-    # ========================================================
     # 11. PHÂN TÍCH DATASET VÀ TIMESTAMP TỪ TÊN FILE
-    # ========================================================
-    #
-    # Ví dụ:
-    # DR_M_CUST_20260812_110015.csv
-    #
-    # DatasetName = DR_M_CUST
-    # FileTime    = 2026-08-12 11:00:15
-    # ========================================================
-
     $parsedFiles = foreach ($file in $allCsvFiles) {
-        if (
-            $file.Name -match
-            "^(?<Dataset>.+)_(?<Date>\d{8})_(?<Time>\d{6})\.csv$"
-        ) {
+        if ($file.Name -match "^(?<Dataset>.+)_(?<Date>\d{8})_(?<Time>\d{6})\.csv$") {
             $timestampText = "$($Matches.Date)$($Matches.Time)"
-
             try {
-                $fileTimestamp = :ParseExact(
+                # SỬA LỖI CÚ PHÁP TẠI ĐÂY
+                $fileTimestamp = [datetime]::ParseExact(
                     $timestampText,
                     "yyyyMMddHHmmss",
                     [System.Globalization.CultureInfo]::InvariantCulture
@@ -250,19 +138,10 @@ try {
         exit 0
     }
 
-    # ========================================================
     # 12. CHỌN FILE MỚI NHẤT CHO TỪNG DATASET
-    # ========================================================
-
     $latestFiles = foreach ($mapping in $tableMapping) {
-        $matchedFiles = $parsedFiles |
-            Where-Object {
-                $_.DatasetName -eq $mapping.DatasetName
-            } |
-            Sort-Object FileTime -Descending
-
-        $latestFile = $matchedFiles |
-            Select-Object -First 1
+        $matchedFiles = $parsedFiles | Where-Object { $_.DatasetName -eq $mapping.DatasetName } | Sort-Object FileTime -Descending
+        $latestFile = $matchedFiles | Select-Object -First 1
 
         if ($latestFile) {
             [pscustomobject]@{
@@ -271,19 +150,9 @@ try {
                 FileTime    = $latestFile.FileTime
                 FileInfo    = $latestFile.FileInfo
             }
-
-            Write-Log (
-                "Đã chọn file mới nhất cho {0}: {1}, timestamp: {2}" -f
-                $mapping.DatasetName,
-                $latestFile.FileInfo.Name,
-                $latestFile.FileTime.ToString("yyyy-MM-dd HH:mm:ss")
-            )
-        }
-        else {
-            Write-Log (
-                "[CẢNH BÁO] Không tìm thấy file cho dataset: {0}" -f
-                $mapping.DatasetName
-            )
+            Write-Log ("Đã chọn file mới nhất cho {0}: {1}, timestamp: {2}" -f $mapping.DatasetName, $latestFile.FileInfo.Name, $latestFile.FileTime.ToString("yyyy-MM-dd HH:mm:ss"))
+        } else {
+            Write-Log ("[CẢNH BÁO] Không tìm thấy file cho dataset: {0}" -f $mapping.DatasetName)
         }
     }
 
@@ -292,39 +161,26 @@ try {
         exit 0
     }
 
-    Write-Log "Số dataset có file hợp lệ: $($latestFiles.Count)"
-
-    # ========================================================
     # 13. KHỞI TẠO FILE SQL
-    # ========================================================
-
     $copySqlCommands = @(
-        "-- ==================================================="
-        "-- File SQL được tạo tự động bởi PowerShell"
-        "-- Thời điểm tạo: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        "-- ==================================================="
-        ""
-        "USE ROLE $snowRole;"
-        "USE WAREHOUSE $snowWarehouse;"
-        "USE DATABASE $snowDatabase;"
-        "USE SCHEMA $snowSchema;"
+        "-- File SQL được tạo tự động bởi PowerShell",
+        "USE ROLE $snowRole;",
+        "USE WAREHOUSE $snowWarehouse;",
+        "USE DATABASE $snowDatabase;",
+        "USE SCHEMA $snowSchema;",
         ""
     )
 
     $uploadedFiles = @()
     $uploadFailedCount = 0
 
-    # ========================================================
     # 14. UPLOAD FILE MỚI NHẤT CỦA TỪNG DATASET
-    # ========================================================
-
     foreach ($item in $latestFiles) {
-        $fileInfo = $item.FileInfo
-        $fileName = $fileInfo.Name
-        $tableName = $item.TableName
+        $fileInfo    = $item.FileInfo
+        $fileName    = $fileInfo.Name
+        $tableName   = $item.TableName
         $datasetName = $item.DatasetName
 
-        # Chỉ cho phép identifier Snowflake dạng đơn giản
         if ($tableName -notmatch "^[A-Za-z_][A-Za-z0-9_$]*$") {
             Write-Log "[LỖI] Tên bảng không hợp lệ: $tableName"
             $uploadFailedCount++
@@ -332,60 +188,25 @@ try {
         }
 
         $fullTableName = "$snowDatabase.$snowSchema.$tableName"
+        $tableStage     = "@$snowDatabase.$snowSchema.%$tableName"
 
-        # Fully-qualified table stage
-        $tableStage = "@$snowDatabase.$snowSchema.%$tableName"
+        Write-Log "Uploading $fileName -> $fullTableName..."
 
-        Write-Log "----------------------------------------------------"
-        Write-Log "Dataset: $datasetName"
-        Write-Log "File: $fileName"
-        Write-Log "Table: $fullTableName"
-        Write-Log "Stage: $tableStage"
-        Write-Log "Đang upload file..."
-
-        $uploadOutput = & $snowExe stage copy `
-            $fileInfo.FullName `
-            $tableStage `
-            --connection $snowConnection `
-            --database $snowDatabase `
-            --schema $snowSchema `
-            --role $snowRole `
-            --overwrite `
-            --no-auto-compress 2>&1
-
+        $uploadOutput = & $snowExe stage copy $fileInfo.FullName $tableStage --connection $snowConnection --database $snowDatabase --schema $snowSchema --role $snowRole --overwrite --no-auto-compress 2>&1
         $uploadExitCode = $LASTEXITCODE
 
-        $uploadOutput |
-            ForEach-Object {
-                Write-Log "[UPLOAD] $_"
-            }
+        $uploadOutput | ForEach-Object { Write-Log "[UPLOAD] $_" }
 
         if ($uploadExitCode -ne 0) {
-            Write-Log (
-                "[LỖI] Upload thất bại: {0}. Exit code: {1}" -f
-                $fileName,
-                $uploadExitCode
-            )
-
+            Write-Log ("[LỖI] Upload thất bại: {0}. Exit code: {1}" -f $fileName, $uploadExitCode)
             $uploadFailedCount++
             continue
         }
 
-        Write-Log "Upload thành công: $fileName"
-
         $uploadedFiles += $item
-
-        # Escape dấu nháy đơn trong tên file nếu có
         $sqlFileName = $fileName -replace "'", "''"
 
-        # Chỉ nạp chính xác file vừa upload bằng FILES
         $copySqlCommands += @"
--- ===================================================
--- Dataset: $datasetName
--- File: $sqlFileName
--- Table: $fullTableName
--- ===================================================
-
 COPY INTO $fullTableName
 FROM $tableStage
 FILES = ('$sqlFileName')
@@ -400,110 +221,49 @@ FILE_FORMAT = (
 )
 ON_ERROR = 'ABORT_STATEMENT'
 PURGE = TRUE;
-
 "@
     }
-
-    # ========================================================
-    # 15. KIỂM TRA KẾT QUẢ UPLOAD
-    # ========================================================
 
     if ($uploadedFiles.Count -eq 0) {
         throw "Không có file nào upload thành công."
     }
 
-    # ========================================================
-    # 16. GHI FILE SQL KHÔNG CÓ UTF-8 BOM
-    # ========================================================
-
+    # 16. GHI FILE SQL UTF-8 NO-BOM
     $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($sqlPath, $copySqlCommands, $utf8WithoutBom)
 
-    [System.IO.File]::WriteAllLines(
-        $sqlPath,
-        $copySqlCommands,
-        $utf8WithoutBom
-    )
-
-    Write-Log "Đã tạo file SQL: $sqlPath"
-    Write-Log "Số file upload thành công: $($uploadedFiles.Count)"
-    Write-Log "Số file upload thất bại: $uploadFailedCount"
-
-    # ========================================================
     # 17. THỰC THI COPY INTO
-    # ========================================================
-
     Write-Log "Đang thực thi COPY INTO..."
-
-    $sqlOutput = & $snowExe sql `
-        --connection $snowConnection `
-        --filename $sqlPath 2>&1
-
+    $sqlOutput = & $snowExe sql --connection $snowConnection --filename $sqlPath 2>&1
     $sqlExitCode = $LASTEXITCODE
 
-    $sqlOutput |
-        ForEach-Object {
-            Write-Log "[COPY] $_"
-        }
+    $sqlOutput | ForEach-Object { Write-Log "[COPY] $_" }
 
     if ($sqlExitCode -ne 0) {
         throw "COPY INTO thất bại. Snowflake CLI exit code: $sqlExitCode"
     }
 
-    Write-Log "COPY INTO hoàn tất thành công."
-
-    # ========================================================
     # 18. ARCHIVE FILE ĐÃ NẠP THÀNH CÔNG
-    # ========================================================
-
-    $archiveDateDir = Join-Path `
-        $archiveDir `
-        (Get-Date -Format "yyyyMMdd")
-
+    $archiveDateDir = Join-Path $archiveDir (Get-Date -Format "yyyyMMdd")
     if (-not (Test-Path -LiteralPath $archiveDateDir)) {
-        New-Item `
-            -Path $archiveDateDir `
-            -ItemType Directory `
-            -Force |
-            Out-Null
+        New-Item -Path $archiveDateDir -ItemType Directory -Force | Out-Null
     }
 
     foreach ($item in $uploadedFiles) {
-        $sourceFile = $item.FileInfo.FullName
-        $destinationFile = Join-Path `
-            $archiveDateDir `
-            $item.FileInfo.Name
-
-        Move-Item `
-            -LiteralPath $sourceFile `
-            -Destination $destinationFile `
-            -Force
-
+        Move-Item -LiteralPath $item.FileInfo.FullName -Destination (Join-Path $archiveDateDir $item.FileInfo.Name) -Force
         Write-Log "Đã archive: $($item.FileInfo.Name)"
     }
 
-    Write-Log "===================================================="
     Write-Log "THÀNH CÔNG: Đã nạp $($uploadedFiles.Count) file."
-    Write-Log "===================================================="
-
     exit 0
 }
 catch {
-    Write-Log "===================================================="
     Write-Log "THẤT BẠI: $($_.Exception.Message)"
-    Write-Log "File CSV được giữ nguyên để kiểm tra/chạy lại."
-    Write-Log "===================================================="
-
     exit 1
 }
 finally {
-    # Luôn xóa lock file khi kết thúc
     if (Test-Path -LiteralPath $lockPath) {
-        Remove-Item `
-            -LiteralPath $lockPath `
-            -Force `
-            -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
     }
-
-    Write-Log "========== KẾT THÚC QUY TRÌNH =========="
-    Write-Log ""
+    Write-Log "========== KẾT THÚC QUY TRÌNH ==========`n"
 }
