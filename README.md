@@ -1,2 +1,82 @@
-# hyu--porfolio
-i'm a beginner
+# ==========================================
+# 1. CẤU HÌNH BIẾN MÔI TRƯỜNG
+# ==========================================
+$workDir = "C:\SnowflakeAuto"
+$sqlPath = "$workDir\upload_all.sql"
+$logPath = "$workDir\process_log.txt"
+$snowConnection = "my_db_conn" # Tên kết nối trong file config của bạn
+
+# Hàm ghi Log
+Function Write-Log {
+    Param ([string]$Message)
+    $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$time - $Message" | Out-File -FilePath $logPath -Append
+}
+
+Write-Log "========== BẮT ĐẦU QUY TRÌNH NẠP 7 FILE =========="
+
+try {
+    # ==========================================
+    # 2. KHAI BÁO DANH SÁCH ÁNH XẠ (MAPPING TỪNG FILE VỚI TỪNG BẢNG)
+    # Bạn thay đổi đường dẫn CSV và tên bảng thực tế vào đây
+    # ==========================================
+    $tableMapping = @(
+        [pscustomobject]@{ CsvPath = "C:\data\nhan_vien.csv"; TableName = "EMPLOYEES_TABLE" },
+        [pscustomobject]@{ CsvPath = "C:\data\doanh_thu.csv"; TableName = "REVENUE_TABLE" },
+        [pscustomobject]@{ CsvPath = "C:\data\san_pham.csv";  TableName = "PRODUCTS_TABLE" },
+        [pscustomobject]@{ CsvPath = "C:\data\ton_kho.csv";   TableName = "INVENTORY_TABLE" },
+        [pscustomobject]@{ CsvPath = "C:\data\khach_hang.csv";TableName = "CUSTOMERS_TABLE" },
+        [pscustomobject]@{ CsvPath = "C:\data\don_hang.csv";  TableName = "ORDERS_TABLE" },
+        [pscustomobject]@{ CsvPath = "C:\data\chi_phi.csv";   TableName = "COSTS_TABLE" }
+    )
+
+    # ==========================================
+    # 3. TỰ ĐỘNG TẠO SCRIPT SQL CHO TOÀN BỘ 7 BẢNG
+    # ==========================================
+  Write-Log "Đang tạo kịch bản SQL gộp cho $($tableMapping.Count) bảng..."
+    
+  $sqlCommands = @() # Mảng chứa các dòng lệnh SQL
+    
+    # Lặp qua từng file để tạo lệnh PUT và COPY INTO tương ứng
+    foreach ($item in $tableMapping) {
+        # Kiểm tra xem file CSV có tồn tại không trước khi tạo lệnh
+        if (Test-Path $item.CsvPath) {
+            $putPath = $item.CsvPath -replace '\\', '/'
+            $fileName = [System.IO.Path]::GetFileName($item.CsvPath)
+            $table = $item.TableName
+            
+            # Ghi chú trong file SQL cho dễ đọc
+            $sqlCommands += "-- === Đẩy dữ liệu cho bảng $table ==="
+            $sqlCommands += "PUT file://$putPath @%$table AUTO_COMPRESS=TRUE OVERWRITE=TRUE;"
+            # Sử dụng ON_ERROR = CONTINUE để nếu file này lỗi định dạng, các file khác vẫn được nạp
+            $sqlCommands += "COPY INTO $table FROM @%$table/$fileName.gz FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER=1 FIELD_OPTIONALLY_ENCLOSED_BY='`"') ON_ERROR = 'CONTINUE';"
+            $sqlCommands += "`n" # Thêm dòng trống cho dễ nhìn
+            
+            Write-Log " -> Đã thêm lệnh xử lý cho file: $fileName vào bảng: $table"
+        } else {
+            Write-Log " [CẢNH BÁO] Không tìm thấy file: $($item.CsvPath) -> Bỏ qua bảng $($item.TableName)."
+        }
+    }
+
+    # Xuất toàn bộ lệnh ra 1 file SQL duy nhất
+    $sqlCommands | Out-File -FilePath $sqlPath -Encoding UTF8
+    Write-Log "Đã tạo thành công file cấu hình SQL: $sqlPath"
+
+    # ==========================================
+    # 4. GỌI SNOWSQL 1 LẦN DUY NHẤT ĐỂ CHẠY FILE SCRIPT VỪA TẠO
+    # ==========================================
+    Write-Log "Bắt đầu gọi SnowSQL để đẩy hàng loạt dữ liệu..."
+    
+    $process = Start-Process -FilePath "snowsql" -ArgumentList "-c $snowConnection -f `"$sqlPath`"" -Wait -NoNewWindow -PassThru
+
+    if ($process.ExitCode -eq 0) {
+        Write-Log "THÀNH CÔNG! Hoàn tất nạp dữ liệu cho các bảng."
+    } else {
+        Write-Log "THẤT BẠI! SnowSQL trả về mã lỗi: $($process.ExitCode)."
+    }
+
+} catch {
+    Write-Log "LỖI HỆ THỐNG: $($_.Exception.Message)"
+}
+
+Write-Log "========== KẾT THÚC QUY TRÌNH ==========`n"
