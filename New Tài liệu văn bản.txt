@@ -1,85 +1,1219 @@
-# ==========================================
-# 1. CẤU HÌNH MÔI TRƯỜNG (Snowflake CLI)
-# ==========================================
-$workDir = "C:\SnowflakeAuto"
-$sqlPath = "$workDir\copy_into_all.sql"
-$logPath = "$workDir\process_log.txt"
-# Tên connection khai báo trong file ~/.snowflake/config.toml
-$snowConnection = "my_conn" 
+#Requires -Version 5.1
 
-# Hàm ghi Log
-Function Write-Log {
-    Param ([string]$Message)
-    $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "$time - $Message" | Out-File -FilePath $logPath -Append
-}
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 
-Write-Log "========== BẮT ĐẦU QUA TRÌNH NẠP 7 FILE (SNOWFLAKE CLI) =========="
+Import-Module CredentialManager -ErrorAction Stop
 
-try {
-    # ==========================================
-    # 2. KHAI BÁO ÁNH XẠ 7 FILE CSV CHỦ LỰC VỚI 7 BẢNG
-    # ==========================================
-    $tableMapping = @(
-        [pscustomobject]@{ CsvPath = "C:\data\nhan_vien.csv"; TableName = "EMPLOYEES_TABLE" },
-        [pscustomobject]@{ CsvPath = "C:\data\doanh_thu.csv"; TableName = "REVENUE_TABLE" },
-        [pscustomobject]@{ CsvPath = "C:\data\san_pham.csv";  TableName = "PRODUCTS_TABLE" },
-        [pscustomobject]@{ CsvPath = "C:\data\ton_kho.csv";   TableName = "INVENTORY_TABLE" },
-        [pscustomobject]@{ CsvPath = "C:\data\khach_hang.csv";TableName = "CUSTOMERS_TABLE" },
-        [pscustomobject]@{ CsvPath = "C:\data\don_hang.csv";  TableName = "ORDERS_TABLE" },
-        [pscustomobject]@{ CsvPath = "C:\data\chi_phi.csv";   TableName = "COSTS_TABLE" }
+# ============================================================
+# Global configuration
+# ============================================================
+
+$CredentialTarget = "SnowflakePrivateKeyPassphrase"
+$ConnectionName   = "my_example_connection"
+
+$SourceFolder = "C:\Export\OracleCsv"
+$StageName    = "@TRAINING_DB.TRAINING_SCHEMA.CSV_STAGE"
+
+# $true  = PUT + validation only. No data is loaded.
+# $false = PUT + validation + COPY INTO.
+$ValidationOnly = $false
+
+# If true, COPY INTO uses FORCE = TRUE.
+# Keep false unless intentionally reloading the same staged filename.
+# FORCE = TRUE can create duplicate rows.
+$ForceReload = $false
+
+# If false, a successfully executed COPY that loads zero rows is treated
+# as an error. This helps detect skipped files and header-only files.
+$AllowZeroRowsLoaded = $false
+
+# Remove the local source CSV only after a successful COPY.
+# This setting has no effect in ValidationOnly mode.
+$DeleteLocalFileAfterSuccess = $false
+
+# Archive the local source CSV after a successful COPY.
+# Archive is generally safer than deletion.
+$ArchiveLocalFileAfterSuccess = $true
+$ArchiveRootFolder = "C:\Export\OracleCsv\Archive"
+
+# Delete the staged CSV after a successful COPY.
+$RemoveStageFileAfterSuccess = $false
+
+# Continue processing other mappings when one mapping fails.
+$ContinueOnItemError = $true
+
+# File stability settings.
+$FileStableCheckSeconds = 5
+$RequiredStableChecks   = 3
+$FileStableTimeoutSec   = 300
+
+# Mutex prevents two scheduled executions from running simultaneously.
+# If the scheduled-task account cannot create a Global mutex,
+# change this to "SnowflakeOracleCsvLoader".
+$MutexName = "Global\SnowflakeOracleCsvLoader"
+
+# ============================================================
+# Logging configuration
+# ============================================================
+
+$LogRootFolder = Join-Path -Path $PSScriptRoot -ChildPath "Logs"
+$ErrorLogFolder = Join-Path -Path $LogRootFolder -ChildPath "Errors"
+
+$RunTimestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+$RunLogPath = Join-Path `
+    -Path $LogRootFolder `
+    -ChildPath "SnowflakeLoad_$RunTimestamp.log"
+
+$ErrorLogPath = Join-Path `
+    -Path $ErrorLogFolder `
+    -ChildPath "SnowflakeLoad_Error_$RunTimestamp.log"
+
+$ErrorFileCreated = $false
+
+# ============================================================
+# CSV-to-table mappings
+#
+# Expected filename:
+#   DR_M_CUST_20260806_115339.csv
+# ============================================================
+
+$LoadConfigs = @(
+    @{
+        Name        = "DR_M_CUST"
+        StageFolder = "dr_m_cust"
+        TargetTable = "TRAINING_DB.TRAINING_SCHEMA.AUTO_M_CUST"
+    },
+    @{
+        Name        = "DR_M_ENTITY"
+        StageFolder = "dr_m_entity"
+        TargetTable = "TRAINING_DB.TRAINING_SCHEMA.AUTO_M_ENTITY"
+    },
+    @{
+        Name        = "DR_M_PRODUCT"
+        StageFolder = "dr_m_product"
+        TargetTable = "TRAINING_DB.TRAINING_SCHEMA.AUTO_M_PRODUCT"
+    },
+    @{
+        Name        = "DR_M_PRODUCT_CATEGORY"
+        StageFolder = "dr_m_product_category"
+        TargetTable = "TRAINING_DB.TRAINING_SCHEMA.AUTO_M_PRODUCT_CATEGORY"
+    },
+    @{
+        Name        = "DR_M_STORE"
+        StageFolder = "dr_m_store"
+        TargetTable = "TRAINING_DB.TRAINING_SCHEMA.AUTO_M_STORE"
+    },
+    @{
+        Name        = "DR_T_PRODUCT_SALES"
+        StageFolder = "dr_t_product_sales"
+        TargetTable = "TRAINING_DB.TRAINING_SCHEMA.AUTO_T_PRODUCT_SALES"
+    },
+    @{
+        Name        = "DR_T_PRODUCT_SALES_BUDGET"
+        StageFolder = "dr_t_product_sales_budget"
+        TargetTable = "TRAINING_DB.TRAINING_SCHEMA.AUTO_T_PRODUCT_SALES_BUDGET"
+    }
+)
+
+# ============================================================
+# Runtime variables
+# ============================================================
+
+$Credential  = $null
+$Mutex       = $null
+$HasMutex    = $false
+
+$LoadResults = [System.Collections.Generic.List[object]]::new()
+
+# ============================================================
+# Logging functions
+# ============================================================
+
+function Write-RunLog {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Message
     )
 
-    $copySqlCommands = @()
+    $LogLine = "{0} {1}" -f `
+        (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), `
+        $Message
 
-    # ==========================================
-    # 3. ĐẨY TỪNG FILE LÊN STAGE BẰNG SNOWFLAKE CLI
-    # ==========================================
-    foreach ($item in $tableMapping) {
-        if (Test-Path $item.CsvPath) {
-            $csvFile = $item.CsvPath
-            $tableName = $item.TableName
-            $fileName = [System.IO.Path]::GetFileName($csvFile)
-
-            Write-Log "Đang upload $fileName lên Table Stage (@%$tableName)..."
-            
-            # Sử dụng lệnh native `snow stage copy` của Snowflake CLI
-            $uploadProcess = Start-Process -FilePath "snow" -ArgumentList "stage copy `"$csvFile`" `"@%$tableName`" -c $snowConnection --overwrite" -Wait -NoNewWindow -PassThru
-
-            if ($uploadProcess.ExitCode -eq 0) {
-                Write-Log "   -> Tải file $fileName lên Stage thành công."
-                
-                # Tạo lệnh COPY INTO tương ứng cho bảng
-                $copySqlCommands += "COPY INTO $tableName FROM @%$tableName/$fileName FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER=1 FIELD_OPTIONALLY_ENCLOSED_BY='`"') ON_ERROR = 'CONTINUE';"
-            } else {
-                Write-Log "   -> LỖI khi upload $fileName! Mã lỗi: $($uploadProcess.ExitCode)"
-            }
-        } else {
-            Write-Log " [CẢNH BÁO] Không tìm thấy file: $($item.CsvPath) -> Bỏ qua bảng $tableName."
-        }
-    }
-
-    # ==========================================
-    # 4. CHẠY LỆNH COPY INTO BẰNG `snow sql`
-    # ==========================================
-    if ($copySqlCommands.Count -gt 0) {
-        $copySqlCommands | Out-File -FilePath $sqlPath -Encoding UTF8
-        Write-Log "Đang thực thi lệnh nạp dữ liệu COPY INTO cho các bảng..."
-
-        # Gọi `snow sql` để thực thi file script SQL vừa khởi tạo
-        $sqlProcess = Start-Process -FilePath "snow" -ArgumentList "sql -c $snowConnection -f `"$sqlPath`"" -Wait -NoNewWindow -PassThru
-
-        if ($sqlProcess.ExitCode -eq 0) {
-            Write-Log "THÀNH CÔNG! Đã nạp dữ liệu hoàn tất vào Snowflake."
-        } else {
-            Write-Log "THẤT BẠI! Lệnh `snow sql` trả về mã lỗi: $($sqlProcess.ExitCode)."
-        }
-    } else {
-        Write-Log "Không có file CSV nào hợp lệ để xử lý."
-    }
-
-} catch {
-    Write-Log "LỖI HỆ THỐNG: $($_.Exception.Message)"
+    $LogLine | Out-File `
+        -LiteralPath $script:RunLogPath `
+        -Append `
+        -Encoding utf8
 }
 
-Write-Log "========== KẾT THÚC QUY TRÌNH ==========`n"
+function Write-ErrorLog {
+    param(
+        [AllowEmptyString()]
+        [string]$ItemName,
+
+        [AllowEmptyString()]
+        [string]$SourceFile,
+
+        [AllowEmptyString()]
+        [string]$TargetTable,
+
+        [AllowEmptyString()]
+        [string]$Message,
+
+        [AllowNull()]
+        [object[]]$CommandOutput
+    )
+
+    $script:ErrorFileCreated = $true
+
+    $Lines = @(
+        "============================================================"
+        "Error time   : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        "Item         : $ItemName"
+        "Source file  : $SourceFile"
+        "Target table : $TargetTable"
+        "Error        : $Message"
+    )
+
+    if ($null -ne $CommandOutput -and $CommandOutput.Count -gt 0) {
+        $Lines += "Snowflake CLI output:"
+
+        foreach ($OutputLine in $CommandOutput) {
+            $Lines += [string]$OutputLine
+        }
+    }
+
+    $Lines += ""
+
+    $Lines | Out-File `
+        -LiteralPath $script:ErrorLogPath `
+        -Append `
+        -Encoding utf8
+}
+
+# ============================================================
+# Snowflake CLI functions
+# ============================================================
+
+function Invoke-SnowSql {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Query,
+
+        [Parameter(Mandatory)]
+        [string]$Operation
+    )
+
+    Write-RunLog "START: $Operation"
+
+    $CommandOutput = @(
+        & snow sql `
+            --connection $script:ConnectionName `
+            --query $Query `
+            --enhanced-exit-codes 2>&1
+    )
+
+    $ExitCode = $LASTEXITCODE
+
+    foreach ($Line in $CommandOutput) {
+        $TextLine = [string]$Line
+
+        Write-Host $TextLine
+        Write-RunLog $TextLine
+    }
+
+    if ($ExitCode -ne 0) {
+        $Exception = [System.Exception]::new(
+            "$Operation failed. Snowflake CLI exit code: $ExitCode"
+        )
+
+        $Exception.Data["CommandOutput"] = @($CommandOutput)
+        $Exception.Data["ExitCode"] = $ExitCode
+
+        throw $Exception
+    }
+
+    Write-RunLog "SUCCESS: $Operation"
+
+    # The leading comma prevents PowerShell from unrolling a
+    # single-element array.
+    return ,$CommandOutput
+}
+
+function Test-SnowflakeConnection {
+    Write-RunLog "START: Snowflake connection test"
+
+    $CommandOutput = @(
+        & snow connection test `
+            --connection $script:ConnectionName 2>&1
+    )
+
+    $ExitCode = $LASTEXITCODE
+
+    foreach ($Line in $CommandOutput) {
+        $TextLine = [string]$Line
+
+        Write-Host $TextLine
+        Write-RunLog $TextLine
+    }
+
+    if ($ExitCode -ne 0) {
+        $Exception = [System.Exception]::new(
+            "Snowflake connection test failed. Exit code: $ExitCode"
+        )
+
+        $Exception.Data["CommandOutput"] = @($CommandOutput)
+        $Exception.Data["ExitCode"] = $ExitCode
+
+        throw $Exception
+    }
+
+    Write-RunLog "SUCCESS: Snowflake connection test"
+}
+
+# ============================================================
+# File handling functions
+# ============================================================
+
+function Get-LatestExportFile {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Folder,
+
+        [Parameter(Mandatory)]
+        [string]$Prefix
+    )
+
+    $EscapedPrefix = :Escape($Prefix)
+
+    $FileRegex = (
+        "^${EscapedPrefix}_" +
+        "(?<ExportTimestamp>[0-9]{8}_[0-9]{6})" +
+        "\.csv$"
+    )
+
+    $MatchingFiles = @(
+        Get-ChildItem `
+            -LiteralPath $Folder `
+            -File `
+            -ErrorAction Stop |
+        Where-Object {
+            $_.Name -match $FileRegex
+        } |
+        ForEach-Object {
+            if ($_.Name -match $FileRegex) {
+                try {
+                    $ParsedTimestamp = :ParseExact(
+                        $Matches.ExportTimestamp,
+                        "yyyyMMdd_HHmmss",
+                        [System.Globalization.CultureInfo]::InvariantCulture,
+                        [System.Globalization.DateTimeStyles]::None
+                    )
+
+                    [PSCustomObject]@{
+                        File            = $_
+                        ExportTimestamp = $ParsedTimestamp
+                    }
+                }
+                catch {
+                    Write-RunLog (
+                        "Ignored file with invalid timestamp: {0}" -f
+                        $_.FullName
+                    )
+                }
+            }
+        }
+    )
+
+    if ($MatchingFiles.Count -eq 0) {
+        throw (
+            "No matching CSV found. Expected: " +
+            "$Folder\${Prefix}_yyyyMMdd_HHmmss.csv"
+        )
+    }
+
+    return $MatchingFiles |
+        Sort-Object `
+            @{ Expression = "ExportTimestamp"; Descending = $true },
+            @{ Expression = { $_.File.LastWriteTime }; Descending = $true } |
+        Select-Object -First 1 |
+        Select-Object -ExpandProperty File
+}
+
+function Wait-FileStable {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [int]$CheckIntervalSeconds = 5,
+
+        [int]$RequiredStableChecks = 3,
+
+        [int]$TimeoutSeconds = 300
+    )
+
+    if ($CheckIntervalSeconds -lt 1) {
+        throw "CheckIntervalSeconds must be at least 1."
+    }
+
+    if ($RequiredStableChecks -lt 1) {
+        throw "RequiredStableChecks must be at least 1."
+    }
+
+    if ($TimeoutSeconds -lt $CheckIntervalSeconds) {
+        throw (
+            "TimeoutSeconds must be greater than or equal to " +
+            "CheckIntervalSeconds."
+        )
+    }
+
+    $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    $PreviousLength = -1L
+    $PreviousWriteTimeUtc = :MinValue
+    $StableCount = 0
+
+    while ($Stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $File = Get-Item `
+            -LiteralPath $Path `
+            -ErrorAction Stop
+
+        $CurrentLength = $File.Length
+        $CurrentWriteTimeUtc = $File.LastWriteTimeUtc
+
+        if (
+            $CurrentLength -gt 0 -and
+            $CurrentLength -eq $PreviousLength -and
+            $CurrentWriteTimeUtc -eq $PreviousWriteTimeUtc
+        ) {
+            $StableCount++
+        }
+        else {
+            $StableCount = 0
+        }
+
+        Write-RunLog (
+            "File stability check: Path={0}; Size={1}; " +
+            "StableCount={2}/{3}" -f
+            $Path,
+            $CurrentLength,
+            $StableCount,
+            $RequiredStableChecks
+        )
+
+        if ($StableCount -ge $RequiredStableChecks) {
+            $Stopwatch.Stop()
+            return $File
+        }
+
+        $PreviousLength = $CurrentLength
+        $PreviousWriteTimeUtc = $CurrentWriteTimeUtc
+
+        Start-Sleep -Seconds $CheckIntervalSeconds
+    }
+
+    $Stopwatch.Stop()
+
+    throw (
+        "Timed out after $TimeoutSeconds seconds while waiting for " +
+        "the file to become stable: $Path"
+    )
+}
+
+function Move-FileToArchive {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SourcePath,
+
+        [Parameter(Mandatory)]
+        [string]$ArchiveRoot
+    )
+
+    $ArchiveDateFolder = Join-Path `
+        -Path $ArchiveRoot `
+        -ChildPath (Get-Date -Format "yyyyMMdd")
+
+    New-Item `
+        -ItemType Directory `
+        -Path $ArchiveDateFolder `
+        -Force `
+        -ErrorAction Stop |
+        Out-Null
+
+    $FileName = Split-Path `
+        -Path $SourcePath `
+        -Leaf
+
+    $DestinationPath = Join-Path `
+        -Path $ArchiveDateFolder `
+        -ChildPath $FileName
+
+    if (Test-Path -LiteralPath $DestinationPath -PathType Leaf) {
+        $NameWithoutExtension = [System.IO.Path]::GetFileNameWithoutExtension(
+            $FileName
+        )
+
+        $Extension = [System.IO.Path]::GetExtension($FileName)
+        $ArchiveTimestamp = Get-Date -Format "yyyyMMdd_HHmmssfff"
+
+        $DestinationFileName = (
+            "{0}_archived_{1}{2}" -f
+            $NameWithoutExtension,
+            $ArchiveTimestamp,
+            $Extension
+        )
+
+        $DestinationPath = Join-Path `
+            -Path $ArchiveDateFolder `
+            -ChildPath $DestinationFileName
+    }
+
+    Move-Item `
+        -LiteralPath $SourcePath `
+        -Destination $DestinationPath `
+        -ErrorAction Stop
+
+    return $DestinationPath
+}
+
+# ============================================================
+# Result validation functions
+# ============================================================
+
+function Assert-ValidationSucceeded {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$CommandOutput,
+
+        [Parameter(Mandatory)]
+        [string]$FileName
+    )
+
+    $OutputText = $CommandOutput -join "`n"
+
+    # SQL returns one of:
+    # VALIDATION_RESULT|OK|0
+    # VALIDATION_RESULT|FAILED|<error count>
+    $Match = :Match(
+        $OutputText,
+        "VALIDATION_RESULT\|(OK|FAILED)\|([0-9]+)"
+    )
+
+    if (-not $Match.Success) {
+        throw (
+            "Unable to determine validation result for file: " +
+            "$FileName"
+        )
+    }
+
+    $ValidationStatus = $Match.Groups[1].Value
+    $ErrorCount = [int64]$Match.Groups[2].Value
+
+    if ($ValidationStatus -ne "OK" -or $ErrorCount -gt 0) {
+        throw (
+            "CSV validation failed for $FileName. " +
+            "Validation error count: $ErrorCount"
+        )
+    }
+}
+
+function Get-CopyResult {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$CommandOutput,
+
+        [Parameter(Mandatory)]
+        [string]$FileName
+    )
+
+    $OutputText = $CommandOutput -join "`n"
+
+    # SQL marker format:
+    # COPY_RESULT|<file count>|<rows parsed>|<rows loaded>|
+    #             <errors seen>|<bad status count>
+    $Match = :Match(
+        $OutputText,
+        (
+            "COPY_RESULT\|" +
+            "([0-9]+)\|" +
+            "([0-9]+)\|" +
+            "([0-9]+)\|" +
+            "([0-9]+)\|" +
+            "([0-9]+)"
+        )
+    )
+
+    if (-not $Match.Success) {
+        throw (
+            "Unable to determine COPY result for file: " +
+            "$FileName"
+        )
+    }
+
+    return [PSCustomObject]@{
+        FileCount      = [int64]$Match.Groups[1].Value
+        RowsParsed     = [int64]$Match.Groups[2].Value
+        RowsLoaded     = [int64]$Match.Groups[3].Value
+        ErrorsSeen     = [int64]$Match.Groups[4].Value
+        BadStatusCount = [int64]$Match.Groups[5].Value
+    }
+}
+
+# ============================================================
+# Main process
+# ============================================================
+
+try {
+    # Create log directories before other processing.
+    New-Item `
+        -ItemType Directory `
+        -Path $LogRootFolder `
+        -Force |
+        Out-Null
+
+    New-Item `
+        -ItemType Directory `
+        -Path $ErrorLogFolder `
+        -Force |
+        Out-Null
+
+    Write-RunLog "Snowflake multi-table load started."
+
+    # ========================================================
+    # Configuration validation
+    # ========================================================
+
+    if (
+        $DeleteLocalFileAfterSuccess -and
+        $ArchiveLocalFileAfterSuccess
+    ) {
+        throw (
+            "DeleteLocalFileAfterSuccess and " +
+            "ArchiveLocalFileAfterSuccess cannot both be true."
+        )
+    }
+
+    if (
+        $ValidationOnly -and
+        (
+            $DeleteLocalFileAfterSuccess -or
+            $ArchiveLocalFileAfterSuccess
+        )
+    ) {
+        Write-RunLog (
+            "ValidationOnly is enabled. Local delete/archive " +
+            "settings will be ignored."
+        )
+    }
+
+    if (-not (Test-Path -LiteralPath $SourceFolder -PathType Container)) {
+        throw "Source folder does not exist: $SourceFolder"
+    }
+
+    if (-not (Get-Command snow -ErrorAction SilentlyContinue)) {
+        throw "Snowflake CLI command 'snow' was not found in PATH."
+    }
+
+    # ========================================================
+    # Prevent concurrent execution
+    # ========================================================
+
+    $Mutex = [System.Threading.Mutex]::new(
+        $false,
+        $MutexName
+    )
+
+    try {
+        $HasMutex = $Mutex.WaitOne(0)
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        # The previous process terminated without releasing the mutex.
+        # The current process now owns it and may continue.
+        $HasMutex = $true
+
+        Write-RunLog (
+            "An abandoned mutex was detected. " +
+            "The current process acquired ownership."
+        )
+    }
+
+    if (-not $HasMutex) {
+        throw (
+            "Another Snowflake CSV load process is already running. " +
+            "Mutex: $MutexName"
+        )
+    }
+
+    Write-RunLog "Execution mutex acquired: $MutexName"
+
+    # ========================================================
+    # Retrieve private-key passphrase
+    # ========================================================
+
+    $Credential = Get-StoredCredential `
+        -Target $CredentialTarget
+
+    if ($null -eq $Credential) {
+        throw "Credential was not found: $CredentialTarget"
+    }
+
+    $Passphrase = $Credential.GetNetworkCredential().Password
+
+    if (:IsNullOrWhiteSpace($Passphrase)) {
+        throw (
+            "The stored private-key passphrase is empty: " +
+            $CredentialTarget
+        )
+    }
+
+    # Passphrase exists only inside this PowerShell process.
+    $env:PRIVATE_KEY_PASSPHRASE = $Passphrase
+    $Passphrase = $null
+
+    # ========================================================
+    # Test Snowflake connection
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "Testing Snowflake connection..."
+
+    Test-SnowflakeConnection
+
+    Write-Host "Snowflake connection test succeeded."
+
+    Write-Host ""
+    Write-Host "============================================"
+    Write-Host "Starting Snowflake multi-table load"
+    Write-Host "Source folder           : $SourceFolder"
+    Write-Host "Connection              : $ConnectionName"
+    Write-Host "Stage                   : $StageName"
+    Write-Host "File format             : $FileFormatName"
+    Write-Host "Number of configurations: $($LoadConfigs.Count)"
+    Write-Host "Validation only         : $ValidationOnly"
+    Write-Host "Force reload            : $ForceReload"
+    Write-Host "============================================"
+
+    # ========================================================
+    # Process each CSV-to-table mapping
+    # ========================================================
+
+    foreach ($Config in $LoadConfigs) {
+        $Name        = [string]$Config.Name
+        $StageFolder = [string]$Config.StageFolder
+        $TargetTable = [string]$Config.TargetTable
+
+        $SourceCsvPath = $null
+        $CsvFileName   = $null
+        $ArchivedPath  = $null
+
+        $RowsParsed = 0L
+        $RowsLoaded = 0L
+        $ErrorsSeen = 0L
+
+        $StagePath = "$StageName/$StageFolder/"
+
+        $StartTime = Get-Date
+
+        $CurrentStatus  = "STARTED"
+        $CurrentMessage = ""
+
+        $LastCommandOutput = @()
+
+        Write-Host ""
+        Write-Host "================================================"
+        Write-Host "Processing : $Name"
+        Write-Host "Target     : $TargetTable"
+        Write-Host "Stage path : $StagePath"
+        Write-Host "================================================"
+
+        Write-RunLog (
+            "Processing started: Name=$Name; " +
+            "Target=$TargetTable; StagePath=$StagePath"
+        )
+
+        try {
+            # ====================================================
+            # Step 1: Select latest matching CSV
+            # ====================================================
+
+            Write-Host ""
+            Write-Host "Step 1: Selecting latest export file..."
+
+            $LatestFile = Get-LatestExportFile `
+                -Folder $SourceFolder `
+                -Prefix $Name
+
+            $SourceCsvPath = $LatestFile.FullName
+            $CsvFileName   = $LatestFile.Name
+
+            # Wait until both file size and LastWriteTime remain stable.
+            $LatestFile = Wait-FileStable `
+                -Path $SourceCsvPath `
+                -CheckIntervalSeconds $FileStableCheckSeconds `
+                -RequiredStableChecks $RequiredStableChecks `
+                -TimeoutSeconds $FileStableTimeoutSec
+
+            if ($LatestFile.Length -eq 0) {
+                throw "CSV file is empty: $SourceCsvPath"
+            }
+
+            Write-Host "Selected file : $CsvFileName"
+            Write-Host "Full path     : $SourceCsvPath"
+            Write-Host "Last modified : $($LatestFile.LastWriteTime)"
+            Write-Host "File size     : $($LatestFile.Length) bytes"
+
+            Write-RunLog (
+                "Selected file: Name=$CsvFileName; " +
+                "Path=$SourceCsvPath; Size=$($LatestFile.Length); " +
+                "LastWriteTime=$($LatestFile.LastWriteTime)"
+            )
+
+            # ====================================================
+            # Build SQL-safe values
+            # ====================================================
+
+            $CsvFileUri = "file://" + (
+                $SourceCsvPath -replace "\\", "/"
+            )
+
+            $CsvFileUriSql = $CsvFileUri.Replace("'", "''")
+            $CsvFileNameSql = $CsvFileName.Replace("'", "''")
+            $FileFormatNameSql = $FileFormatName.Replace("'", "''")
+
+            $ForceSql = if ($ForceReload) {
+                "FORCE = TRUE"
+            }
+            else {
+                "FORCE = FALSE"
+            }
+
+            # ----------------------------------------------------
+            # PUT statement
+            # ----------------------------------------------------
+
+            $PutSql = @"
+PUT '$CsvFileUriSql' $StagePath
+AUTO_COMPRESS = FALSE
+OVERWRITE = TRUE;
+"@
+
+            # ----------------------------------------------------
+            # Validation statement
+            #
+            # The second query creates a deterministic marker:
+            # VALIDATION_RESULT|OK|0
+            # VALIDATION_RESULT|FAILED|N
+            # ----------------------------------------------------
+
+            $ValidationSql = @"
+COPY INTO $TargetTable
+FROM $StagePath
+FILES = ('$CsvFileNameSql')
+FILE_FORMAT = (
+    FORMAT_NAME = '$FileFormatNameSql'
+)
+VALIDATION_MODE = RETURN_ALL_ERRORS;
+
+SELECT
+    'VALIDATION_RESULT|' ||
+    IFF(COUNT(*) = 0, 'OK', 'FAILED') ||
+    '|' ||
+    COUNT(*)::VARCHAR AS VALIDATION_RESULT
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+"@
+
+            # ----------------------------------------------------
+            # COPY statement
+            #
+            # The second query creates a deterministic marker:
+            # COPY_RESULT|file_count|rows_parsed|rows_loaded|
+            #             errors_seen|bad_status_count
+            # ----------------------------------------------------
+
+            $CopySql = @"
+COPY INTO $TargetTable
+FROM $StagePath
+FILES = ('$CsvFileNameSql')
+FILE_FORMAT = (
+    FORMAT_NAME = '$FileFormatNameSql'
+)
+ON_ERROR = 'ABORT_STATEMENT'
+$ForceSql;
+
+SELECT
+    'COPY_RESULT|' ||
+    COUNT(*)::VARCHAR ||
+    '|' ||
+    COALESCE(SUM("rows_parsed"), 0)::VARCHAR ||
+    '|' ||
+    COALESCE(SUM("rows_loaded"), 0)::VARCHAR ||
+    '|' ||
+    COALESCE(SUM("errors_seen"), 0)::VARCHAR ||
+    '|' ||
+    COUNT_IF(
+        COALESCE("status", '') NOT IN (
+            'LOADED',
+            'LOAD_SKIPPED'
+        )
+    )::VARCHAR AS COPY_RESULT
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+"@
+
+            # ----------------------------------------------------
+            # Exact staged file removal
+            # ----------------------------------------------------
+
+            $RemoveSql = @"
+REMOVE $StagePath$CsvFileNameSql;
+"@
+
+            # ====================================================
+            # Step 2: PUT
+            # ====================================================
+
+            Write-Host ""
+            Write-Host "Step 2: Uploading CSV to Snowflake stage..."
+
+            $LastCommandOutput = @(
+                Invoke-SnowSql `
+                    -Query $PutSql `
+                    -Operation "PUT for $Name"
+            )
+
+            Write-Host "PUT completed successfully."
+
+            # ====================================================
+            # Step 3: Validate
+            # ====================================================
+
+            Write-Host ""
+            Write-Host "Step 3: Validating staged CSV..."
+
+            $LastCommandOutput = @(
+                Invoke-SnowSql `
+                    -Query $ValidationSql `
+                    -Operation "Validation for $Name"
+            )
+
+            Assert-ValidationSucceeded `
+                -CommandOutput $LastCommandOutput `
+                -FileName $CsvFileName
+
+            Write-Host "CSV validation completed with no errors."
+            Write-RunLog "CSV validation succeeded: $CsvFileName"
+
+            if ($ValidationOnly) {
+                $CurrentStatus = "VALIDATED"
+
+                $CurrentMessage = (
+                    "PUT and validation completed. " +
+                    "Data was not loaded."
+                )
+
+                Write-Host ""
+                Write-Host "Validation-only mode is enabled."
+                Write-Host "Data was NOT loaded into $TargetTable."
+            }
+            else {
+                # =================================================
+                # Step 4: COPY INTO
+                # =================================================
+
+                Write-Host ""
+                Write-Host "Step 4: Loading CSV into target table..."
+
+                $LastCommandOutput = @(
+                    Invoke-SnowSql `
+                        -Query $CopySql `
+                        -Operation "COPY INTO for $Name"
+                )
+
+                $CopyResult = Get-CopyResult `
+                    -CommandOutput $LastCommandOutput `
+                    -FileName $CsvFileName
+
+                $RowsParsed = $CopyResult.RowsParsed
+                $RowsLoaded = $CopyResult.RowsLoaded
+                $ErrorsSeen = $CopyResult.ErrorsSeen
+
+                if ($CopyResult.FileCount -eq 0) {
+                    throw (
+                        "COPY completed but returned no file result " +
+                        "for $CsvFileName."
+                    )
+                }
+
+                if ($CopyResult.BadStatusCount -gt 0) {
+                    throw (
+                        "COPY returned one or more unsuccessful statuses. " +
+                        "Bad status count: " +
+                        $CopyResult.BadStatusCount
+                    )
+                }
+
+                if ($CopyResult.ErrorsSeen -gt 0) {
+                    throw (
+                        "COPY reported data errors. Errors seen: " +
+                        $CopyResult.ErrorsSeen
+                    )
+                }
+
+                if (
+                    -not $AllowZeroRowsLoaded -and
+                    $CopyResult.RowsLoaded -eq 0
+                ) {
+                    throw (
+                        "COPY completed but loaded zero rows. " +
+                        "The file may already have been loaded, may contain " +
+                        "only a header, or may have been skipped. File: " +
+                        $CsvFileName
+                    )
+                }
+
+                $CurrentStatus = "LOADED"
+
+                $CurrentMessage = (
+                    "COPY completed. Rows parsed: {0}; " +
+                    "Rows loaded: {1}; Errors seen: {2}." -f
+                    $RowsParsed,
+                    $RowsLoaded,
+                    $ErrorsSeen
+                )
+
+                Write-Host "COPY INTO completed successfully."
+                Write-Host "Rows parsed : $RowsParsed"
+                Write-Host "Rows loaded : $RowsLoaded"
+                Write-Host "Errors seen : $ErrorsSeen"
+
+                Write-RunLog (
+                    "COPY result: File=$CsvFileName; " +
+                    "RowsParsed=$RowsParsed; " +
+                    "RowsLoaded=$RowsLoaded; " +
+                    "ErrorsSeen=$ErrorsSeen"
+                )
+
+                # =================================================
+                # Step 5: Optional stage cleanup
+                # =================================================
+
+                if ($RemoveStageFileAfterSuccess) {
+                    Write-Host ""
+                    Write-Host "Step 5: Removing staged CSV..."
+
+                    $LastCommandOutput = @(
+                        Invoke-SnowSql `
+                            -Query $RemoveSql `
+                            -Operation "Stage REMOVE for $Name"
+                    )
+
+                    Write-Host "Staged CSV removed successfully."
+                }
+
+                # =================================================
+                # Step 6: Optional local archive or deletion
+                #
+                # This section is intentionally inside the COPY
+                # success branch. It never runs in ValidationOnly.
+                # =================================================
+
+                if ($ArchiveLocalFileAfterSuccess) {
+                    Write-Host ""
+                    Write-Host "Step 6: Archiving local CSV..."
+
+                    $ArchivedPath = Move-FileToArchive `
+                        -SourcePath $SourceCsvPath `
+                        -ArchiveRoot $ArchiveRootFolder
+
+                    Write-Host "Local CSV archived successfully."
+                    Write-Host "Archive path: $ArchivedPath"
+
+                    Write-RunLog (
+                        "Local CSV archived: Source=$SourceCsvPath; " +
+                        "Destination=$ArchivedPath"
+                    )
+                }
+                elseif ($DeleteLocalFileAfterSuccess) {
+                    Write-Host ""
+                    Write-Host "Step 6: Removing local CSV..."
+
+                    Remove-Item `
+                        -LiteralPath $SourceCsvPath `
+                        -Force `
+                        -ErrorAction Stop
+
+                    Write-Host "Local source CSV removed successfully."
+                    Write-RunLog "Local CSV deleted: $SourceCsvPath"
+                }
+            }
+        }
+        catch {
+            $CurrentStatus  = "FAILED"
+            $CurrentMessage = $_.Exception.Message
+
+            Write-Host ""
+            Write-Error "[$Name] $CurrentMessage"
+
+            $CapturedOutput = @($LastCommandOutput)
+
+            if ($_.Exception.Data.Contains("CommandOutput")) {
+                $CapturedOutput = @(
+                    $_.Exception.Data["CommandOutput"]
+                )
+            }
+
+            Write-ErrorLog `
+                -ItemName $Name `
+                -SourceFile $(if ($null -eq $SourceCsvPath) {
+                    ""
+                }
+                else {
+                    $SourceCsvPath
+                }) `
+                -TargetTable $TargetTable `
+                -Message $CurrentMessage `
+                -CommandOutput $CapturedOutput
+
+            Write-RunLog (
+                "FAILED: Name=$Name; Message=$CurrentMessage"
+            )
+
+            if (-not $ContinueOnItemError) {
+                throw
+            }
+        }
+        finally {
+            $EndTime = Get-Date
+
+            $DurationSeconds = :Round(
+                ($EndTime - $StartTime).TotalSeconds,
+                2
+            )
+
+            $LoadResults.Add(
+                [PSCustomObject]@{
+                    Name        = $Name
+                    SourceFile  = $SourceCsvPath
+                    StagedFile  = $CsvFileName
+                    ArchivedTo  = $ArchivedPath
+                    TargetTable = $TargetTable
+                    Status      = $CurrentStatus
+                    RowsParsed  = $RowsParsed
+                    RowsLoaded  = $RowsLoaded
+                    ErrorsSeen  = $ErrorsSeen
+                    Message     = $CurrentMessage
+                    StartedAt   = $StartTime
+                    FinishedAt  = $EndTime
+                    DurationSec = $DurationSeconds
+                }
+            )
+
+            Write-RunLog (
+                "Processing finished: Name=$Name; " +
+                "Status=$CurrentStatus; " +
+                "DurationSec=$DurationSeconds"
+            )
+        }
+    }
+
+    # ========================================================
+    # Final summary
+    # ========================================================
+
+    Write-Host ""
+    Write-Host "============================================"
+    Write-Host "LOAD SUMMARY"
+    Write-Host "============================================"
+
+    $SummaryText = $LoadResults |
+        Format-Table `
+            Name,
+            Status,
+            StagedFile,
+            RowsParsed,
+            RowsLoaded,
+            ErrorsSeen,
+            DurationSec,
+            Message `
+            -AutoSize |
+        Out-String -Width 300
+
+    Write-Host $SummaryText
+    Write-RunLog "LOAD SUMMARY:`r`n$SummaryText"
+
+    $FailedResults = @(
+        $LoadResults |
+        Where-Object {
+            $_.Status -eq "FAILED"
+        }
+    )
+
+    if ($FailedResults.Count -gt 0) {
+        throw (
+            "$($FailedResults.Count) of " +
+            "$($LoadConfigs.Count) file(s) failed."
+        )
+    }
+
+    Write-Host ""
+    Write-Host (
+        "All $($LoadConfigs.Count) file(s) completed successfully."
+    )
+    Write-Host "Run log: $RunLogPath"
+
+    if ($ErrorFileCreated) {
+        Write-Host "Error log: $ErrorLogPath"
+    }
+
+    Write-RunLog "All files completed successfully."
+}
+catch {
+    $FatalMessage = $_.Exception.Message
+
+    Write-Error $FatalMessage
+
+    if (Test-Path -LiteralPath $ErrorLogFolder -PathType Container) {
+        $FatalCommandOutput = @()
+
+        if ($_.Exception.Data.Contains("CommandOutput")) {
+            $FatalCommandOutput = @(
+                $_.Exception.Data["CommandOutput"]
+            )
+        }
+
+        Write-ErrorLog `
+            -ItemName "SCRIPT" `
+            -SourceFile "" `
+            -TargetTable "" `
+            -Message $FatalMessage `
+            -CommandOutput $FatalCommandOutput
+
+        Write-Host "Error log: $ErrorLogPath"
+    }
+
+    exit 1
+}
+finally {
+    # Remove the passphrase from the process environment.
+    Remove-Item Env:\PRIVATE_KEY_PASSPHRASE `
+        -ErrorAction SilentlyContinue
+
+    $Credential = $null
+
+    if ($HasMutex -and $null -ne $Mutex) {
+        try {
+            $Mutex.ReleaseMutex()
+            Write-RunLog "Execution mutex released: $MutexName"
+        }
+        catch {
+            # Do not override the original script result because of
+            # a mutex cleanup error.
+        }
+    }
+
+    if ($null -ne $Mutex) {
+        $Mutex.Dispose()
+        $Mutex = $null
+    }
+}
