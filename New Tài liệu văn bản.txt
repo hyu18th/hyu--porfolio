@@ -1,3 +1,4 @@
+
 #Requires -Version 5.1
 
 $ErrorActionPreference = "Stop"
@@ -1216,4 +1217,3 @@ finally {
         $Mutex.Dispose()
         $Mutex = $null
     }
-}
